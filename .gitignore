@@ -8,3 +8,4 @@ release/
 publish/*.dll
 *.zip
 .tmp-decompile/
+.tmp-upload/
