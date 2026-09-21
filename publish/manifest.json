@@ -1,0 +1,9 @@
+{
+  "name": "CartTracking",
+  "version_number": "1.0.0",
+  "website_url": "https://github.com/MattHB1/valheim-cart-tracking",
+  "description": "See all cart positions on the map. Single player or multiplayer.",
+  "dependencies": [
+    "denikson-BepInExPack_Valheim-5.4.2350"
+  ]
+}
