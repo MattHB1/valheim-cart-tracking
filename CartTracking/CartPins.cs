@@ -1,0 +1,341 @@
+using System.Collections.Generic;
+using HarmonyLib;
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace CartTracking;
+
+internal static class CartPins
+{
+  private static readonly Dictionary<ZDOID, MarkerState> Markers = new();
+  private static readonly Dictionary<int, Sprite?> SpriteCache = new();
+  private static Sprite? _fallbackSprite;
+  private static int _lastLoggedCount = -1;
+
+  private sealed class MarkerState
+  {
+    public Vector3 Pos;
+    public int PrefabHash;
+    public GameObject? Marker;
+  }
+
+  internal static void Clear()
+  {
+    foreach (var state in Markers.Values)
+      DestroyMarker(state);
+    Markers.Clear();
+    _lastLoggedCount = -1;
+  }
+
+  internal static void Apply(IReadOnlyList<CartSnapshot> carts)
+  {
+    try
+    {
+      ApplyInternal(carts);
+    }
+    catch (System.Exception ex)
+    {
+      CartTrackingPlugin.Log.LogError($"CartPins.Apply failed: {ex}");
+    }
+  }
+
+  private static void ApplyInternal(IReadOnlyList<CartSnapshot> carts)
+  {
+    if (!CartTrackingPlugin.ShowPins.Value)
+    {
+      Clear();
+      return;
+    }
+
+    var seen = new HashSet<ZDOID>();
+
+    foreach (var cart in carts)
+    {
+      seen.Add(cart.Id);
+
+      if (!IsSanePosition(cart.Position))
+      {
+        RemoveTracked(cart.Id);
+        continue;
+      }
+
+      if (!Markers.TryGetValue(cart.Id, out var state))
+      {
+        state = new MarkerState();
+        Markers[cart.Id] = state;
+      }
+
+      state.Pos = cart.Position;
+      state.PrefabHash = cart.PrefabHash;
+    }
+
+    var stale = new List<ZDOID>();
+    foreach (var id in Markers.Keys)
+    {
+      if (!seen.Contains(id))
+        stale.Add(id);
+    }
+    foreach (var id in stale)
+      RemoveTracked(id);
+
+    if (Markers.Count != _lastLoggedCount)
+    {
+      _lastLoggedCount = Markers.Count;
+      CartTrackingPlugin.Log.LogInfo($"Map markers tracked: {Markers.Count}");
+      foreach (var kv in Markers)
+        CartTrackingPlugin.Log.LogInfo($"  Cart @ {kv.Value.Pos}");
+    }
+  }
+
+  // Called every Minimap.UpdatePins frame - draws overlays without relying on AddPin.
+  internal static void UpdateDrawnMarkers()
+  {
+    try
+    {
+      if (!CartTrackingPlugin.ShowPins.Value || !Minimap.instance || Markers.Count == 0)
+      {
+        if (Markers.Count == 0)
+          return;
+        foreach (var state in Markers.Values)
+          DestroyMarker(state);
+        return;
+      }
+
+      var mm = Minimap.instance;
+      var largeRoot = GetField<GameObject>(mm, "m_largeRoot");
+      var mapImageLarge = GetField<RawImage>(mm, "m_mapImageLarge");
+      var mapImageSmall = GetField<RawImage>(mm, "m_mapImageSmall");
+      var pinRootLarge = GetField<RectTransform>(mm, "m_pinRootLarge");
+      var pinRootSmall = GetField<RectTransform>(mm, "m_pinRootSmall");
+      var pinPrefab = GetField<GameObject>(mm, "m_pinPrefab");
+      if (!largeRoot || !mapImageLarge || !mapImageSmall || !pinRootLarge || !pinRootSmall || !pinPrefab)
+        return;
+
+      var large = largeRoot.activeSelf;
+      var rawImage = large ? mapImageLarge : mapImageSmall;
+      var parent = large ? pinRootLarge : pinRootSmall;
+      if (!rawImage || !parent || !rawImage.rectTransform)
+        return;
+
+      var size = large
+        ? GetField<float>(mm, "m_pinSizeLarge")
+        : GetField<float>(mm, "m_pinSizeSmall");
+      if (size <= 0f)
+        size = large ? 32f : 16f;
+
+      var states = new List<MarkerState>(Markers.Values);
+      foreach (var state in states)
+      {
+        if (state == null)
+          continue;
+        if (!IsPointVisible(state.Pos, rawImage, mm))
+        {
+          DestroyMarker(state);
+          continue;
+        }
+
+        DrawMarker(state, size, parent, rawImage, pinPrefab, mm);
+      }
+    }
+    catch (System.Exception ex)
+    {
+      CartTrackingPlugin.Log.LogWarning($"UpdateDrawnMarkers: {ex.Message}");
+    }
+  }
+
+  private static void DrawMarker(
+    MarkerState state,
+    float size,
+    RectTransform parent,
+    RawImage rawImage,
+    GameObject pinPrefab,
+    Minimap mm)
+  {
+    var go = state.Marker;
+    if (!go || go.transform.parent != parent)
+    {
+      if (go)
+        Object.Destroy(go);
+
+      go = Object.Instantiate(pinPrefab);
+      state.Marker = go;
+      go.transform.SetParent(parent, false);
+
+      var image = go.GetComponent<Image>();
+      if (image)
+        image.sprite = ResolveSprite(state.PrefabHash) ?? image.sprite;
+
+      var rt = go.transform as RectTransform;
+      if (rt)
+      {
+        rt.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal, size * 1.25f);
+        rt.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, size * 1.25f);
+      }
+    }
+
+    WorldToMapPoint(state.Pos, mm, out var mx, out var my);
+    var anchored = MapPointToLocalGuiPos(mx, my, rawImage);
+    var rect = go.transform as RectTransform;
+    if (rect)
+      rect.anchoredPosition = anchored;
+
+    var checkedGo = go.transform.Find("Checked");
+    if (checkedGo)
+      checkedGo.gameObject.SetActive(false);
+
+    // No name labels - icon only.
+    var vanilla = go.transform.Find("Name");
+    if (vanilla)
+      vanilla.gameObject.SetActive(false);
+  }
+
+  private static Sprite? ResolveSprite(int prefabHash)
+  {
+    if (SpriteCache.TryGetValue(prefabHash, out var cached))
+      return cached ?? GetFallbackSprite();
+
+    Sprite? sprite = null;
+    try
+    {
+      if (ZNetScene.instance != null)
+      {
+        var prefab = ZNetScene.instance.GetPrefab(prefabHash);
+        if (prefab)
+        {
+          var piece = prefab.GetComponent<Piece>();
+          if (piece)
+          {
+            var iconField = AccessTools.Field(typeof(Piece), "m_icon");
+            sprite = iconField?.GetValue(piece) as Sprite;
+          }
+        }
+      }
+    }
+    catch
+    {
+      // ignored - fall back below
+    }
+
+    SpriteCache[prefabHash] = sprite;
+    return sprite ?? GetFallbackSprite();
+  }
+
+  private static Sprite? GetFallbackSprite()
+  {
+    if (_fallbackSprite)
+      return _fallbackSprite;
+    try
+    {
+      var mm = Minimap.instance;
+      if (!mm)
+        return null;
+      var icons = GetField<object>(mm, "m_icons");
+      if (icons is System.Collections.IList list)
+      {
+        foreach (var entry in list)
+        {
+          if (entry == null)
+            continue;
+          var name = entry.GetType().GetField("m_name")?.GetValue(entry)?.ToString()
+                     ?? entry.GetType().GetField("m_type")?.GetValue(entry)?.ToString();
+          var sprite = entry.GetType().GetField("m_icon")?.GetValue(entry) as Sprite
+                       ?? entry.GetType().GetField("m_sprite")?.GetValue(entry) as Sprite;
+          if (sprite == null)
+            continue;
+          if (name != null && (name.Contains("Death") || name.Contains("Icon0")))
+          {
+            _fallbackSprite = sprite;
+            return _fallbackSprite;
+          }
+          _fallbackSprite ??= sprite;
+        }
+      }
+    }
+    catch
+    {
+      // ignored
+    }
+    return _fallbackSprite;
+  }
+
+  private static bool IsPointVisible(Vector3 p, RawImage map, Minimap mm)
+  {
+    WorldToMapPoint(p, mm, out var mx, out var my);
+    var uv = map.uvRect;
+    return mx > uv.xMin && mx < uv.xMax && my > uv.yMin && my < uv.yMax;
+  }
+
+  private static void WorldToMapPoint(Vector3 p, Minimap mm, out float mx, out float my)
+  {
+    var textureSize = GetField<int>(mm, "m_textureSize");
+    var pixelSize = GetField<float>(mm, "m_pixelSize");
+    if (textureSize <= 0 || pixelSize <= 0f)
+    {
+      mx = 0f;
+      my = 0f;
+      return;
+    }
+    var half = textureSize / 2;
+    mx = p.x / pixelSize + half;
+    my = p.z / pixelSize + half;
+    mx /= textureSize;
+    my /= textureSize;
+  }
+
+  private static Vector2 MapPointToLocalGuiPos(float mx, float my, RawImage img)
+  {
+    if (!img || !img.rectTransform)
+      return Vector2.zero;
+    var uv = img.uvRect;
+    if (uv.width <= 0f || uv.height <= 0f)
+      return Vector2.zero;
+    var result = new Vector2(
+      (mx - uv.xMin) / uv.width,
+      (my - uv.yMin) / uv.height);
+    var rect = img.rectTransform.rect;
+    result.x *= rect.width;
+    result.y *= rect.height;
+    return result;
+  }
+
+  private static T? GetField<T>(object obj, string name)
+  {
+    var field = AccessTools.Field(obj.GetType(), name);
+    if (field == null)
+      return default;
+    var value = field.GetValue(obj);
+    if (value is T typed)
+      return typed;
+    if (typeof(T).IsValueType && value != null)
+      return (T)value;
+    return default;
+  }
+
+  private static void RemoveTracked(ZDOID id)
+  {
+    if (!Markers.TryGetValue(id, out var state))
+      return;
+    DestroyMarker(state);
+    Markers.Remove(id);
+  }
+
+  private static void DestroyMarker(MarkerState state)
+  {
+    if (state.Marker)
+    {
+      Object.Destroy(state.Marker);
+      state.Marker = null;
+    }
+  }
+
+  private static bool IsSanePosition(Vector3 pos)
+  {
+    if (float.IsNaN(pos.x) || float.IsNaN(pos.y) || float.IsNaN(pos.z))
+      return false;
+    if (float.IsInfinity(pos.x) || float.IsInfinity(pos.y) || float.IsInfinity(pos.z))
+      return false;
+    if (pos.sqrMagnitude < 0.01f)
+      return false;
+    return true;
+  }
+}
